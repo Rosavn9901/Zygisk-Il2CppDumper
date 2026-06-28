@@ -202,10 +202,62 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 
 #if defined(__arm__) || defined(__aarch64__)
 
+// Get the app's data directory via JNI (used when loaded from APK directly)
+static std::string GetDataDirFromJNI(JavaVM *vm) {
+    JNIEnv *env = nullptr;
+    vm->AttachCurrentThread(&env, nullptr);
+
+    jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
+    if (!activity_thread_clz) return {};
+
+    jmethodID current_app_id = env->GetStaticMethodID(activity_thread_clz,
+                                                       "currentApplication",
+                                                       "()Landroid/app/Application;");
+    if (!current_app_id) return {};
+
+    jobject application = env->CallStaticObjectMethod(activity_thread_clz, current_app_id);
+    if (!application) return {};
+
+    jclass context_clz = env->FindClass("android/content/Context");
+    jmethodID get_data_dir_id = env->GetMethodID(context_clz,
+                                                   "getDataDir",
+                                                   "()Ljava/io/File;");
+    if (!get_data_dir_id) return {};
+
+    jobject data_dir_file = env->CallObjectMethod(application, get_data_dir_id);
+    if (!data_dir_file) return {};
+
+    jclass file_clz = env->FindClass("java/io/File");
+    jmethodID get_path_id = env->GetMethodID(file_clz, "getAbsolutePath", "()Ljava/lang/String;");
+    auto path_jstr = (jstring) env->CallObjectMethod(data_dir_file, get_path_id);
+    if (!path_jstr) return {};
+
+    auto path_cstr = env->GetStringUTFChars(path_jstr, nullptr);
+    std::string result(path_cstr);
+    env->ReleaseStringUTFChars(path_jstr, path_cstr);
+    LOGI("GetDataDirFromJNI: %s", result.c_str());
+    return result;
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    auto game_data_dir = (const char *) reserved;
-    std::thread hack_thread(hack_start, game_data_dir);
-    hack_thread.detach();
+    if (reserved != nullptr) {
+        // Called via NativeBridge (x86 emulator path from Zygisk)
+        auto game_data_dir = (const char *) reserved;
+        std::thread hack_thread(hack_start, game_data_dir);
+        hack_thread.detach();
+    } else {
+        // Called via System.loadLibrary() — APK injection mode
+        // Get data dir from JNI since there is no Zygisk to pass it
+        auto data_dir = GetDataDirFromJNI(vm);
+        if (!data_dir.empty()) {
+            auto game_data_dir = new char[data_dir.size() + 1];
+            strcpy(game_data_dir, data_dir.c_str());
+            std::thread hack_thread(hack_start, game_data_dir);
+            hack_thread.detach();
+        } else {
+            LOGE("JNI_OnLoad: failed to get data dir, dump aborted");
+        }
+    }
     return JNI_VERSION_1_6;
 }
 

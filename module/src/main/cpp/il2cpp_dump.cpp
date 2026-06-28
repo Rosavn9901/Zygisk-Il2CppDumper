@@ -12,6 +12,7 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -36,6 +37,30 @@ void init_il2cpp_api(void *handle) {
 #include "il2cpp-api-functions.h"
 
 #undef DO_API
+}
+
+// Escape a string for JSON output
+static std::string json_escape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    return out;
 }
 
 std::string get_method_modifier(uint32_t flags) {
@@ -101,10 +126,12 @@ std::string dump_method(Il2CppClass *klass) {
         if (method->methodPointer) {
             outPut << "\t// RVA: 0x";
             outPut << std::hex << (uint64_t) method->methodPointer - il2cpp_base;
+            outPut << " Offset: 0x";
+            outPut << std::hex << (uint64_t) method->methodPointer - il2cpp_base;
             outPut << " VA: 0x";
             outPut << std::hex << (uint64_t) method->methodPointer;
         } else {
-            outPut << "\t// RVA: 0x VA: 0x0";
+            outPut << "\t// RVA: 0x0 Offset: 0x0 VA: 0x0";
         }
         /*if (method->slot != 65535) {
             outPut << " Slot: " << std::dec << method->slot;
@@ -322,6 +349,121 @@ std::string dump_type(const Il2CppType *type) {
     return outPut.str();
 }
 
+// --- Offset / script.json structures ---
+
+struct ScriptMethod {
+    uint64_t address; // RVA (offset from il2cpp base)
+    std::string name; // "Namespace.ClassName$$MethodName"
+    std::string signature;
+};
+
+struct ScriptField {
+    int32_t offset;
+    std::string name; // "Namespace.ClassName$$FieldName"
+    std::string type_name;
+    bool is_static;
+};
+
+static void collect_offsets(Il2CppClass *klass,
+                             std::vector<ScriptMethod> &methods,
+                             std::vector<ScriptField> &fields) {
+    auto ns = il2cpp_class_get_namespace(klass);
+    auto class_name = il2cpp_class_get_name(klass);
+    std::string full_class = (ns && ns[0]) ? (std::string(ns) + "." + class_name) : class_name;
+
+    // Collect methods
+    {
+        void *iter = nullptr;
+        while (auto method = il2cpp_class_get_methods(klass, &iter)) {
+            if (!method->methodPointer) continue;
+
+            uint64_t rva = (uint64_t)method->methodPointer - il2cpp_base;
+            auto method_name = il2cpp_method_get_name(method);
+
+            // Build signature string
+            std::string sig;
+            auto return_type = il2cpp_method_get_return_type(method);
+            auto return_class = il2cpp_class_from_type(return_type);
+            sig += il2cpp_class_get_name(return_class);
+            sig += " ";
+            sig += full_class + "$$" + (method_name ? method_name : "");
+            sig += "(";
+            auto param_count = il2cpp_method_get_param_count(method);
+            for (int i = 0; i < param_count; ++i) {
+                auto param = il2cpp_method_get_param(method, i);
+                auto param_class = il2cpp_class_from_type(param);
+                sig += il2cpp_class_get_name(param_class);
+                if (i < param_count - 1) sig += ", ";
+            }
+            sig += ")";
+
+            methods.push_back({rva,
+                               full_class + "$$" + (method_name ? method_name : ""),
+                               sig});
+        }
+    }
+
+    // Collect fields
+    {
+        void *iter = nullptr;
+        while (auto field = il2cpp_class_get_fields(klass, &iter)) {
+            auto field_name = il2cpp_field_get_name(field);
+            auto field_type = il2cpp_field_get_type(field);
+            auto field_class = il2cpp_class_from_type(field_type);
+            auto attrs = il2cpp_field_get_flags(field);
+            bool is_static = (attrs & FIELD_ATTRIBUTE_STATIC) != 0;
+
+            fields.push_back({il2cpp_field_get_offset(field),
+                              full_class + "$$" + (field_name ? field_name : ""),
+                              il2cpp_class_get_name(field_class),
+                              is_static});
+        }
+    }
+}
+
+static void write_script_json(const std::string &outPath,
+                              const std::vector<ScriptMethod> &methods,
+                              const std::vector<ScriptField> &fields) {
+    std::ofstream f(outPath);
+    f << "{\n";
+
+    // ScriptMethod
+    f << "  \"ScriptMethod\": [\n";
+    for (size_t i = 0; i < methods.size(); ++i) {
+        const auto &m = methods[i];
+        char addr_buf[32];
+        snprintf(addr_buf, sizeof(addr_buf), "0x%" PRIx64, m.address);
+        f << "    {";
+        f << "\"Address\": \"" << addr_buf << "\", ";
+        f << "\"Name\": \"" << json_escape(m.name) << "\", ";
+        f << "\"Signature\": \"" << json_escape(m.signature) << "\"";
+        f << "}";
+        if (i + 1 < methods.size()) f << ",";
+        f << "\n";
+    }
+    f << "  ],\n";
+
+    // ScriptField
+    f << "  \"ScriptField\": [\n";
+    for (size_t i = 0; i < fields.size(); ++i) {
+        const auto &fd = fields[i];
+        char off_buf[32];
+        snprintf(off_buf, sizeof(off_buf), "0x%x", fd.offset);
+        f << "    {";
+        f << "\"Offset\": \"" << off_buf << "\", ";
+        f << "\"Name\": \"" << json_escape(fd.name) << "\", ";
+        f << "\"Type\": \"" << json_escape(fd.type_name) << "\", ";
+        f << "\"IsStatic\": " << (fd.is_static ? "true" : "false");
+        f << "}";
+        if (i + 1 < fields.size()) f << ",";
+        f << "\n";
+    }
+    f << "  ]\n";
+
+    f << "}\n";
+    f.close();
+}
+
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
@@ -354,9 +496,17 @@ void il2cpp_dump(const char *outDir) {
         imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
     }
     std::vector<std::string> outPuts;
+    std::vector<ScriptMethod> allMethods;
+    std::vector<ScriptField> allFields;
+
+    auto process_class = [&](Il2CppClass *klass) {
+        auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
+        collect_offsets(const_cast<Il2CppClass *>(klass), allMethods, allFields);
+        return dump_type(type);
+    };
+
     if (il2cpp_image_get_class) {
         LOGI("Version greater than 2018.3");
-        //使用il2cpp_image_get_class
         for (int i = 0; i < size; ++i) {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
             std::stringstream imageStr;
@@ -364,15 +514,12 @@ void il2cpp_dump(const char *outDir) {
             auto classCount = il2cpp_image_get_class_count(image);
             for (int j = 0; j < classCount; ++j) {
                 auto klass = il2cpp_image_get_class(image, j);
-                auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
+                auto outPut = imageStr.str() + process_class(const_cast<Il2CppClass *>(klass));
                 outPuts.push_back(outPut);
             }
         }
     } else {
         LOGI("Version less than 2018.3");
-        //使用反射
         auto corlib = il2cpp_get_corlib();
         auto assemblyClass = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
         auto assemblyLoad = il2cpp_class_get_method_from_name(assemblyClass, "Load", 1);
@@ -396,7 +543,6 @@ void il2cpp_dump(const char *outDir) {
             std::stringstream imageStr;
             auto image_name = il2cpp_image_get_name(image);
             imageStr << "\n// Dll : " << image_name;
-            //LOGD("image name : %s", image->name);
             auto imageName = std::string(image_name);
             auto pos = imageName.rfind('.');
             auto imageNameNoExt = imageName.substr(0, pos);
@@ -409,15 +555,20 @@ void il2cpp_dump(const char *outDir) {
             auto items = reflectionTypes->vector;
             for (int j = 0; j < reflectionTypes->max_length; ++j) {
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *) items[j]);
-                auto type = il2cpp_class_get_type(klass);
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
+                auto outPut = imageStr.str() + process_class(klass);
                 outPuts.push_back(outPut);
             }
         }
     }
+
+    // Output directory: /sdcard/dump, auto-create if not exist
+    const char *dumpDir = "/sdcard/dump";
+    mkdir(dumpDir, 0777);
+    LOGI("output dir: %s", dumpDir);
+
     LOGI("write dump file");
-    auto outPath = std::string(outDir).append("/files/dump.cs");
+    // Write dump.cs
+    auto outPath = std::string(dumpDir).append("/dump.cs");
     std::ofstream outStream(outPath);
     outStream << imageOutput.str();
     auto count = outPuts.size();
@@ -425,5 +576,11 @@ void il2cpp_dump(const char *outDir) {
         outStream << outPuts[i];
     }
     outStream.close();
-    LOGI("dump done!");
+
+    // Write script.json (offsets)
+    LOGI("write script.json (%zu methods, %zu fields)", allMethods.size(), allFields.size());
+    auto jsonPath = std::string(dumpDir).append("/script.json");
+    write_script_json(jsonPath, allMethods, allFields);
+
+    LOGI("dump done! dump.cs and script.json written to %s", dumpDir);
 }
