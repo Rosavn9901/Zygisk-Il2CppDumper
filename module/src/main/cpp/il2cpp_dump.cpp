@@ -413,7 +413,7 @@ static void collect_offsets(Il2CppClass *klass,
             auto attrs = il2cpp_field_get_flags(field);
             bool is_static = (attrs & FIELD_ATTRIBUTE_STATIC) != 0;
 
-            fields.push_back({il2cpp_field_get_offset(field),
+            fields.push_back({static_cast<int32_t>(il2cpp_field_get_offset(field)),
                               full_class + "$$" + (field_name ? field_name : ""),
                               il2cpp_class_get_name(field_class),
                               is_static});
